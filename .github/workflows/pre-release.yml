@@ -1,0 +1,101 @@
+name: Build and Release Pre-release
+
+on:
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v2
+      with:
+        version: latest
+        
+    - name: Install dependencies
+      run: pnpm install
+      
+    - name: Build project
+      run: pnpm run build
+      
+    - name: Create zip archive
+      run: |
+        cd dist
+        zip -r ../sealdice-ui.zip .
+        cd ..
+        
+    - name: Check if pre-release exists
+      id: check_release
+      run: |
+        RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "https://api.github.com/repos/${{ github.repository }}/releases/tags/pre-release" \
+          | jq -r '.id // empty')
+        
+        if [ ! -z "$RELEASE_ID" ] && [ "$RELEASE_ID" != "null" ]; then
+          echo "release_exists=true" >> $GITHUB_OUTPUT
+          echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
+          echo "Pre-release exists with ID: $RELEASE_ID"
+        else
+          echo "release_exists=false" >> $GITHUB_OUTPUT
+          echo "Pre-release does not exist"
+        fi
+        
+    - name: Delete existing pre-release
+      if: steps.check_release.outputs.release_exists == 'true'
+      run: |
+        curl -X DELETE \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "https://api.github.com/repos/${{ github.repository }}/releases/${{ steps.check_release.outputs.release_id }}"
+        echo "Deleted existing pre-release"
+        
+    - name: Delete existing pre-release tag
+      if: steps.check_release.outputs.release_exists == 'true'
+      run: |
+        curl -X DELETE \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/pre-release"
+        echo "Deleted existing pre-release tag"
+      continue-on-error: true  # 如果tag不存在，继续执行
+      
+    - name: Create new pre-release
+      id: create_release
+      run: |
+        RESPONSE=$(curl -s -X POST \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          "https://api.github.com/repos/${{ github.repository }}/releases" \
+          -d '{
+            "tag_name": "pre-release",
+            "target_commitish": "${{ github.sha }}",
+            "name": "Pre-release Build",
+            "body": "Automated pre-release build from commit ${{ github.sha }}",
+            "draft": false,
+            "prerelease": true
+          }')
+        
+        UPLOAD_URL=$(echo "$RESPONSE" | jq -r '.upload_url' | sed 's/{?name,label}//')
+        echo "upload_url=$UPLOAD_URL" >> $GITHUB_OUTPUT
+        echo "Created new pre-release"
+        
+    - name: Upload zip file to release
+      run: |
+        curl -X POST \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Content-Type: application/zip" \
+          --data-binary @sealdice-ui.zip \
+          "${{ steps.create_release.outputs.upload_url }}?name=sealdice-ui.zip&label=sealdice-ui.zip"
+        echo "Uploaded sealdice-ui.zip to pre-release"
+        
+    - name: Verify release
+      run: |
+        echo "Pre-release created successfully!"
+        echo "Download URL: https://github.com/${{ github.repository }}/releases/download/pre-release/sealdice-ui.zip"
