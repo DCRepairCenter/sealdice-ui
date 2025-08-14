@@ -8,6 +8,9 @@ on:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
     
     steps:
     - name: Checkout code
@@ -241,19 +244,40 @@ jobs:
             \"prerelease\": true
           }")
         
-        UPLOAD_URL=$(echo "$RESPONSE" | jq -r '.upload_url' | sed 's/{?name,label}//')
-        echo "upload_url=$UPLOAD_URL" >> $GITHUB_OUTPUT
-        echo "✅ Created new pre-release with detailed build information"
+        echo "API Response: $RESPONSE"
+        
+        # 检查API响应是否成功
+        if echo "$RESPONSE" | jq -e '.upload_url' > /dev/null; then
+          UPLOAD_URL=$(echo "$RESPONSE" | jq -r '.upload_url' | sed 's/{?name,label}//')
+          echo "upload_url=$UPLOAD_URL" >> $GITHUB_OUTPUT
+          echo "✅ Created new pre-release with detailed build information"
+          echo "📤 Upload URL: $UPLOAD_URL"
+        else
+          echo "❌ Failed to create release. API Response:"
+          echo "$RESPONSE" | jq .
+          exit 1
+        fi
         
     - name: Upload zip file to release
       if: steps.build_step.outputs.build_success == 'true'
       run: |
         echo "📤 Uploading sealdice-ui.zip to pre-release..."
+        
+        # 验证upload_url是否有效
+        UPLOAD_URL="${{ steps.create_release.outputs.upload_url }}"
+        if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
+          echo "❌ Upload URL is empty or null: '$UPLOAD_URL'"
+          echo "🔍 Checking release creation response..."
+          exit 1
+        fi
+        
+        echo "🔗 Upload URL: $UPLOAD_URL"
+        
         if curl -X POST \
           -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
           -H "Content-Type: application/zip" \
           --data-binary @sealdice-ui.zip \
-          "${{ steps.create_release.outputs.upload_url }}?name=sealdice-ui.zip&label=sealdice-ui.zip"; then
+          "$UPLOAD_URL?name=sealdice-ui.zip&label=sealdice-ui.zip"; then
           echo "✅ Successfully uploaded sealdice-ui.zip to pre-release"
         else
           echo "❌ Failed to upload zip file"
