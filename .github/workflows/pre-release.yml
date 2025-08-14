@@ -14,7 +14,7 @@ jobs:
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: '18'
+        node-version: '20'
         
     - name: Setup pnpm
       uses: pnpm/action-setup@v2
@@ -24,8 +24,90 @@ jobs:
     - name: Install dependencies
       run: pnpm install
       
+    - name: Create build config without legacy plugin
+      run: |
+        cat > vite.config.build.ts << 'EOF'
+        import { fileURLToPath, URL } from 'node:url';
+        import { defineConfig, loadEnv } from 'vite';
+        import vue from '@vitejs/plugin-vue';
+        import vueJsx from '@vitejs/plugin-vue-jsx';
+        import AutoImport from 'unplugin-auto-import/vite';
+        import Components from 'unplugin-vue-components/vite';
+        import { ElementPlusResolver } from 'unplugin-vue-components/resolvers';
+        import Icons from 'unplugin-icons/vite';
+        import IconsResolver from 'unplugin-icons/resolver';
+
+        export default defineConfig(({ mode }) => ({
+          base: './',
+          resolve: {
+            alias: {
+              '~': fileURLToPath(new URL('./src', import.meta.url)),
+            },
+          },
+          plugins: [
+            vue(),
+            vueJsx(),
+            AutoImport({
+              include: [
+                /\.[tj]sx?$/,
+                /\.vue$/,
+                /\.vue\?vue/,
+              ],
+              imports: ['vue', 'pinia', 'vue-router', '@vueuse/core'],
+              dts: true,
+              vueTemplate: true,
+              resolvers: [
+                ElementPlusResolver({
+                  importStyle: 'css',
+                }),
+                IconsResolver(),
+              ],
+            }),
+            Components({
+              resolvers: [
+                ElementPlusResolver({
+                  importStyle: 'css',
+                }),
+                IconsResolver(),
+              ],
+            }),
+            Icons({
+              compiler: 'vue3',
+              autoInstall: true,
+            }),
+          ],
+          build: {
+            sourcemap: false,
+            chunkSizeWarningLimit: 1024,
+            rollupOptions: {
+              output: {
+                manualChunks: {
+                  base: ['vue', 'pinia', 'vue-router'],
+                  codemirror: ['codemirror', '@codemirror/lang-javascript'],
+                  common: ['element-plus', 'lodash-es'],
+                  utils: [
+                    '@vueuse/core',
+                    'asmcrypto.js',
+                    'axios',
+                    'axios-retry',
+                    'clipboard',
+                    'dayjs',
+                    'filesize',
+                    'randomcolor',
+                    'vue-diff',
+                    'vuedraggable',
+                  ],
+                },
+              },
+            },
+          },
+        }));
+        EOF
+        
     - name: Build project
-      run: pnpm run build
+      run: |
+        # 使用不包含 legacy 插件的配置文件进行构建
+        pnpm run build-only -- --config vite.config.build.ts
       
     - name: Create zip archive
       run: |
