@@ -1,0 +1,293 @@
+name: Build and Release Pre-release
+
+on:
+  workflow_dispatch:  # 允许手动触发
+  schedule:
+    - cron: '0 */12 * * *'  # 每12小时运行一次 (UTC时间 00:00 和 12:00)
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v2
+      with:
+        version: latest
+        
+    - name: Get build info
+      id: build_info
+      run: |
+        echo "build_time=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+        echo "commit_hash=${{ github.sha }}" >> $GITHUB_OUTPUT
+        echo "commit_short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+        echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+        echo "trigger=${{ github.event_name }}" >> $GITHUB_OUTPUT
+        
+    - name: Install dependencies
+      run: pnpm install
+      
+    - name: Create build config without legacy plugin
+      run: |
+        cat > vite.config.build.ts << 'EOF'
+        import { fileURLToPath, URL } from 'node:url';
+        import { defineConfig, loadEnv } from 'vite';
+        import vue from '@vitejs/plugin-vue';
+        import vueJsx from '@vitejs/plugin-vue-jsx';
+        import AutoImport from 'unplugin-auto-import/vite';
+        import Components from 'unplugin-vue-components/vite';
+        import { ElementPlusResolver } from 'unplugin-vue-components/resolvers';
+        import Icons from 'unplugin-icons/vite';
+        import IconsResolver from 'unplugin-icons/resolver';
+
+        export default defineConfig(({ mode }) => ({
+          base: './',
+          resolve: {
+            alias: {
+              '~': fileURLToPath(new URL('./src', import.meta.url)),
+            },
+          },
+          plugins: [
+            vue(),
+            vueJsx(),
+            AutoImport({
+              include: [
+                /\.[tj]sx?$/,
+                /\.vue$/,
+                /\.vue\?vue/,
+              ],
+              imports: ['vue', 'pinia', 'vue-router', '@vueuse/core'],
+              dts: true,
+              vueTemplate: true,
+              resolvers: [
+                ElementPlusResolver({
+                  importStyle: 'css',
+                }),
+                IconsResolver(),
+              ],
+            }),
+            Components({
+              resolvers: [
+                ElementPlusResolver({
+                  importStyle: 'css',
+                }),
+                IconsResolver(),
+              ],
+            }),
+            Icons({
+              compiler: 'vue3',
+              autoInstall: true,
+            }),
+          ],
+          build: {
+            sourcemap: false,
+            chunkSizeWarningLimit: 1024,
+            rollupOptions: {
+              output: {
+                manualChunks: {
+                  base: ['vue', 'pinia', 'vue-router'],
+                  codemirror: ['codemirror', '@codemirror/lang-javascript'],
+                  common: ['element-plus', 'lodash-es'],
+                  utils: [
+                    '@vueuse/core',
+                    'asmcrypto.js',
+                    'axios',
+                    'axios-retry',
+                    'clipboard',
+                    'dayjs',
+                    'filesize',
+                    'randomcolor',
+                    'vue-diff',
+                    'vuedraggable',
+                  ],
+                },
+              },
+            },
+          },
+        }));
+        EOF
+        
+    - name: Build project
+      id: build_step
+      run: |
+        # 使用不包含 legacy 插件的配置文件进行构建
+        echo "🚀 Starting build process..."
+        if pnpm run build-only -- --config vite.config.build.ts; then
+          echo "✅ Build completed successfully"
+          echo "build_success=true" >> $GITHUB_OUTPUT
+          
+          # 获取构建输出信息
+          BUILD_SIZE=$(du -sh dist | cut -f1)
+          FILE_COUNT=$(find dist -type f | wc -l)
+          echo "build_size=$BUILD_SIZE" >> $GITHUB_OUTPUT
+          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+          
+          echo "📊 Build statistics:"
+          echo "   - Total size: $BUILD_SIZE"
+          echo "   - File count: $FILE_COUNT"
+        else
+          echo "❌ Build failed"
+          echo "build_success=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+      
+    - name: Create zip archive
+      if: steps.build_step.outputs.build_success == 'true'
+      run: |
+        echo "📦 Creating zip archive..."
+        cd dist
+        zip -r ../sealdice-ui.zip .
+        cd ..
+        
+        # 获取zip文件大小
+        ZIP_SIZE=$(du -sh sealdice-ui.zip | cut -f1)
+        echo "📄 Archive created: sealdice-ui.zip ($ZIP_SIZE)"
+        
+    - name: Check if pre-release exists
+      if: steps.build_step.outputs.build_success == 'true'
+      id: check_release
+      run: |
+        echo "🔍 Checking for existing pre-release..."
+        RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "https://api.github.com/repos/${{ github.repository }}/releases/tags/pre-release" \
+          | jq -r '.id // empty')
+        
+        if [ ! -z "$RELEASE_ID" ] && [ "$RELEASE_ID" != "null" ]; then
+          echo "release_exists=true" >> $GITHUB_OUTPUT
+          echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
+          echo "🗑️  Pre-release exists with ID: $RELEASE_ID - will be replaced"
+        else
+          echo "release_exists=false" >> $GITHUB_OUTPUT
+          echo "✨ No existing pre-release found - will create new one"
+        fi
+        
+    - name: Delete existing pre-release
+      if: steps.build_step.outputs.build_success == 'true' && steps.check_release.outputs.release_exists == 'true'
+      run: |
+        echo "🗑️  Deleting existing pre-release..."
+        curl -X DELETE \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "https://api.github.com/repos/${{ github.repository }}/releases/${{ steps.check_release.outputs.release_id }}"
+        echo "✅ Deleted existing pre-release"
+        
+    - name: Delete existing pre-release tag
+      if: steps.build_step.outputs.build_success == 'true' && steps.check_release.outputs.release_exists == 'true'
+      run: |
+        echo "🏷️  Deleting existing pre-release tag..."
+        curl -X DELETE \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/pre-release"
+        echo "✅ Deleted existing pre-release tag"
+      continue-on-error: true  # 如果tag不存在，继续执行
+      
+    - name: Create new pre-release
+      if: steps.build_step.outputs.build_success == 'true'
+      id: create_release
+      run: |
+        echo "🚀 Creating new pre-release..."
+        
+        # 创建详细的发布说明
+        cat > release_body.md << EOF
+        # 🎯 海豹核心前端 Pre-release 构建
+        
+        ## 📋 构建信息
+        
+        | 项目 | 信息 |
+        |------|------|
+        | 🕐 构建时间 | \`${{ steps.build_info.outputs.build_time }}\` |
+        | 🔧 触发方式 | \`${{ steps.build_info.outputs.trigger }}\` |
+        | 🌿 分支 | \`${{ steps.build_info.outputs.branch }}\` |
+        | 📝 提交哈希 | \`${{ steps.build_info.outputs.commit_hash }}\` |
+        | 📊 构建大小 | \`${{ steps.build_step.outputs.build_size }}\` |
+        | 📁 文件数量 | \`${{ steps.build_step.outputs.file_count }}\` 个文件 |
+        | 🏗️ Node.js 版本 | \`20\` |
+        | 📦 包管理器 | \`pnpm\` |
+        
+        ## 📥 下载
+        
+        点击下方的 **sealdice-ui.zip** 下载最新构建版本。
+        
+        ## ⚠️ 注意事项
+        
+        - 这是自动构建的预发布版本，可能包含未经充分测试的功能
+        - 建议在测试环境中使用
+        - 如遇问题请在 [sealdice-core](https://github.com/sealdice/sealdice-core) 仓库提交 Issue
+        
+        ## 🔄 自动构建
+        
+        此版本每12小时自动构建一次，确保与最新代码同步。
+        EOF
+        
+        RELEASE_BODY=$(cat release_body.md | jq -Rs .)
+        
+        RESPONSE=$(curl -s -X POST \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          "https://api.github.com/repos/${{ github.repository }}/releases" \
+          -d "{
+            \"tag_name\": \"pre-release\",
+            \"target_commitish\": \"${{ github.sha }}\",
+            \"name\": \"Pre-release Build (${{ steps.build_info.outputs.commit_short }})\",
+            \"body\": $RELEASE_BODY,
+            \"draft\": false,
+            \"prerelease\": true
+          }")
+        
+        UPLOAD_URL=$(echo "$RESPONSE" | jq -r '.upload_url' | sed 's/{?name,label}//')
+        echo "upload_url=$UPLOAD_URL" >> $GITHUB_OUTPUT
+        echo "✅ Created new pre-release with detailed build information"
+        
+    - name: Upload zip file to release
+      if: steps.build_step.outputs.build_success == 'true'
+      run: |
+        echo "📤 Uploading sealdice-ui.zip to pre-release..."
+        if curl -X POST \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Content-Type: application/zip" \
+          --data-binary @sealdice-ui.zip \
+          "${{ steps.create_release.outputs.upload_url }}?name=sealdice-ui.zip&label=sealdice-ui.zip"; then
+          echo "✅ Successfully uploaded sealdice-ui.zip to pre-release"
+        else
+          echo "❌ Failed to upload zip file"
+          exit 1
+        fi
+        
+    - name: Verify release
+      if: steps.build_step.outputs.build_success == 'true'
+      run: |
+        echo ""
+        echo "🎉 Pre-release created successfully!"
+        echo ""
+        echo "📋 Build Summary:"
+        echo "   ⏰ Build time: ${{ steps.build_info.outputs.build_time }}"
+        echo "   🔧 Triggered by: ${{ steps.build_info.outputs.trigger }}"
+        echo "   📝 Commit: ${{ steps.build_info.outputs.commit_short }}"
+        echo "   📊 Build size: ${{ steps.build_step.outputs.build_size }}"
+        echo "   📁 Files: ${{ steps.build_step.outputs.file_count }}"
+        echo ""
+        echo "🔗 Download URL:"
+        echo "   https://github.com/${{ github.repository }}/releases/download/pre-release/sealdice-ui.zip"
+        echo ""
+        
+    - name: Notify build failure
+      if: failure() && steps.build_step.outputs.build_success == 'false'
+      run: |
+        echo ""
+        echo "❌ Build failed - Pre-release will not be updated"
+        echo ""
+        echo "📋 Failure Summary:"
+        echo "   ⏰ Attempted at: ${{ steps.build_info.outputs.build_time }}"
+        echo "   🔧 Triggered by: ${{ steps.build_info.outputs.trigger }}"
+        echo "   📝 Commit: ${{ steps.build_info.outputs.commit_short }}"
+        echo ""
+        echo "🔍 Please check the build logs above for error details."
+        echo ""
+        exit 1
